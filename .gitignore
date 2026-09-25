@@ -1,0 +1,10 @@
+obj/
+libs/
+build/
+java/build/
+*.o
+*.a
+!prebuilt/*/libimgui.a
+.vscode/
+.idea/
+*.log
