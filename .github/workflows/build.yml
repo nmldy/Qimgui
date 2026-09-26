@@ -13,24 +13,47 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 先解压到临时目录（此时 zip 还在）
+      # 自动找到仓库根目录下的 zip，不再写死文件名
+      - name: Locate zip file
+        id: zip
+        run: |
+          ZIPFILE=$(find . -maxdepth 1 -name '*.zip' -printf '%f\n' | head -n 1)
+          if [ -z "$ZIPFILE" ]; then
+            echo "No zip file found in repo root" >&2
+            exit 1
+          fi
+          echo "zip=$ZIPFILE" >> "$GITHUB_OUTPUT"
+          echo "Using: $ZIPFILE"
+
       - name: Unzip to temp
-        run: unzip -o Qimgui-1.0.0.zip -d /tmp/extract
+        run: unzip -o '${{ steps.zip.outputs.zip }}' -d /tmp/extract
 
-      # 丢弃 zip 自带的 .github，避免 workflow 权限 403
-      - name: Drop zip's own workflows
-        run: rm -rf /tmp/extract/Qimgui-1.0.0/.github
-
-      # 清空一切，只保留 .git、.github/workflows 和 zip 本身
-      - name: Clean everything except .github/workflows and the zip
+      # 自动识别内层目录：zip 里只有一个顶层文件夹就进到它里面，否则直接用解压根
+      - name: Resolve source dir and drop zip's .github
+        id: src
         run: |
-          find . -mindepth 1 -maxdepth 1 ! -name '.git' ! -name 'Qimgui-1.0.0.zip' ! -path './.github' -exec rm -rf {} +
-          find .github -mindepth 1 -maxdepth 1 ! -name 'workflows' -exec rm -rf {} +
+          entries=$(ls -A /tmp/extract | wc -l)
+          first_dir=$(find /tmp/extract -mindepth 1 -maxdepth 1 -type d -print -quit)
+          first_file=$(find /tmp/extract -mindepth 1 -maxdepth 1 -type f -print -quit)
+          if [ "$entries" -eq 1 ] && [ -n "$first_dir" ]; then
+            SRC="$first_dir"
+          else
+            SRC=/tmp/extract
+          fi
+          rm -rf "$SRC/.github"
+          echo "src=$SRC" >> "$GITHUB_OUTPUT"
+          echo "Source dir: $SRC"
 
-      # 把解压内容摊平到根目录
-      - name: Move contents to repo root
+      # 用 git 清理：删除所有被跟踪的文件，只豁免 .github 和 zip 本身
+      - name: Wipe everything except .github and the zip
         run: |
-          rsync -a /tmp/extract/Qimgui-1.0.0/ ./
+          git rm -rq --ignore-unmatch -- . ':(exclude).github' ':(exclude)${{ steps.zip.outputs.zip }}'
+          git clean -fdxq -e '.github' -e '*.zip'
+
+      # 摊平到仓库根目录
+      - name: Extract into repo root
+        run: |
+          rsync -a '${{ steps.src.outputs.src }}/' ./
           rm -rf /tmp/extract
 
       - name: Commit and push
@@ -38,5 +61,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
-          git commit -m "Extract Qimgui-1.0.0.zip to repo root" || echo "No changes"
+          git commit -m "Extract zip to repo root" || echo "No changes"
           git push
