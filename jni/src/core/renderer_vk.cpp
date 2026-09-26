@@ -2,6 +2,7 @@
 
 #include "bloom_vk.h"
 #include "vulkan_wrapper.h"
+#include "aimgui_log.h"
 #include <vulkan/vulkan_android.h>
 
 #include "imgui.h"
@@ -15,65 +16,105 @@
 #include <unistd.h>
 #include <vector>
 
-#define LOG_TAG "AImGui_VK"
-#define LOGE(fmt, ...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, fmt, ##__VA_ARGS__)
-
 namespace aimgui {
 
 namespace {
 
 static void check_vk(VkResult err) {
     if (err != VK_SUCCESS) {
-        LOGE("VkResult = %d", err);
+        AILOGE("VkResult = %d (0x%x)", (int)err, (unsigned)err);
     }
 }
 
 class VKRenderer final : public IRenderer {
 public:
     bool Init(ANativeWindow* window, int width, int height) override {
+        AILOGI("begin window=%p size=%dx%d", window, width, height);
         m_Window = window;
         m_Width  = width;
         m_Height = height;
 
         if (InitVulkan() != 1) {
-            LOGE("Vulkan loader unavailable: %s", dlerror());
+            AILOGE("InitVulkan failed: %s", dlerror());
             return false;
         }
+        AILOGI("InitVulkan OK");
 
         void* libvulkan = dlopen("libvulkan.so", RTLD_NOW);
+        AILOGI("libvulkan = %p", libvulkan);
         ImGui_ImplVulkan_LoadFunctions(0,
             [](const char* name, void* user) -> PFN_vkVoidFunction {
                 return reinterpret_cast<PFN_vkVoidFunction>(dlsym(user, name));
             }, libvulkan);
 
-        if (!CreateInstance()) return false;
-        if (!SelectPhysicalDevice()) return false;
-        if (!CreateLogicalDevice()) return false;
-        if (!CreateDescriptorPool()) return false;
-        if (!CreateSurfaceAndSwapchain()) return false;
+        if (!CreateInstance()) {
+            AILOGE("CreateInstance failed");
+            return false;
+        }
+        AILOGI("CreateInstance OK");
 
-        // Try to set up the bloom pipeline. If it fails for any reason the
-        // renderer falls back to direct-to-swapchain ImGui rendering.
-        if (m_Bloom.Init(m_Device, m_PhysicalDevice, m_DescPool,
-                         m_WD->SurfaceFormat.format, m_Width, m_Height)) {
+        if (!SelectPhysicalDevice()) {
+            AILOGE("SelectPhysicalDevice failed");
+            return false;
+        }
+        AILOGI("SelectPhysicalDevice OK");
+
+        if (!CreateLogicalDevice()) {
+            AILOGE("CreateLogicalDevice failed");
+            return false;
+        }
+        AILOGI("CreateLogicalDevice OK");
+
+        if (!CreateDescriptorPool()) {
+            AILOGE("CreateDescriptorPool failed");
+            return false;
+        }
+        AILOGI("CreateDescriptorPool OK");
+
+        if (!CreateSurfaceAndSwapchain()) {
+            AILOGE("CreateSurfaceAndSwapchain failed");
+            return false;
+        }
+        AILOGI("CreateSurfaceAndSwapchain OK  surfaceFormat=%d presentMode=%d imageCount=%u",
+               (int)m_WD->SurfaceFormat.format,
+               (int)m_WD->PresentMode,
+               (unsigned)m_WD->ImageCount);
+
+        AILOGI("BloomVK::Init ...");
+        bool bloomOk = m_Bloom.Init(m_Device, m_PhysicalDevice, m_DescPool,
+                                    m_WD->SurfaceFormat.format, m_Width, m_Height);
+        AILOGI("BloomVK::Init -> %d (Ready=%d)", (int)bloomOk, (int)m_Bloom.Ready());
+        if (bloomOk) {
+            AILOGI("BloomVK::BindToSwapchainRenderPass ...");
             if (!m_Bloom.BindToSwapchainRenderPass(m_WD->RenderPass)) {
+                AILOGE("BindToSwapchainRenderPass failed; disabling bloom");
                 m_Bloom.Shutdown();
+            } else {
+                AILOGI("BindToSwapchainRenderPass OK");
             }
         }
 
+        AILOGI("SetupImGuiBackend ...");
         SetupImGuiBackend();
+        AILOGI("SetupImGuiBackend done");
 
-        // Now that ImGui's Vulkan impl has its descriptor pool wired up,
-        // hand it the prev-scene image so shatter chips can sample real UI.
-        if (m_Bloom.Ready()) m_Bloom.RegisterImGuiSnapshot();
+        if (m_Bloom.Ready()) {
+            AILOGI("RegisterImGuiSnapshot ...");
+            m_Bloom.RegisterImGuiSnapshot();
+            AILOGI("RegisterImGuiSnapshot done ds=%p",
+                   (void*)m_Bloom.GetSnapshotDescriptorSet());
+        }
 
+        AILOGI("VK Init complete");
         return true;
     }
 
     void NewFrame() override {
-        if (m_SwapChainRebuild) RebuildSwapchain();
+        if (m_SwapChainRebuild) {
+            AILOGI("swapchain rebuild requested");
+            RebuildSwapchain();
+        }
         ImGui_ImplVulkan_NewFrame();
-
         ImGuiIO& io = ImGui::GetIO();
         io.DisplaySize = ImVec2((float)m_Width, (float)m_Height);
         io.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
@@ -82,11 +123,15 @@ public:
     void EndFrame() override {
         ImGui::Render();
         ImDrawData* draw = ImGui::GetDrawData();
-        if (!draw || draw->DisplaySize.x <= 0 || draw->DisplaySize.y <= 0) return;
+        if (!draw || draw->DisplaySize.x <= 0 || draw->DisplaySize.y <= 0) {
+            AILOGW("EndFrame skipped: draw=%p", draw);
+            return;
+        }
         Submit(draw);
     }
 
     void Shutdown() override {
+        AILOGI("enter");
         if (m_Device == VK_NULL_HANDLE) return;
         vkDeviceWaitIdle(m_Device);
         m_Bloom.Shutdown();
@@ -101,6 +146,7 @@ public:
         vkDestroyInstance(m_Instance, nullptr);
         m_Device = VK_NULL_HANDLE;
         m_Instance = VK_NULL_HANDLE;
+        AILOGI("done");
     }
 
     const char* Name() const override { return "Vulkan"; }
@@ -126,24 +172,31 @@ private:
         ci.pApplicationInfo = &ai;
         ci.enabledExtensionCount = 2;
         ci.ppEnabledExtensionNames = exts;
-        return vkCreateInstance(&ci, nullptr, &m_Instance) == VK_SUCCESS;
+        VkResult r = vkCreateInstance(&ci, nullptr, &m_Instance);
+        AILOGI("vkCreateInstance -> %d  instance=%p", (int)r, (void*)m_Instance);
+        return r == VK_SUCCESS;
     }
 
     bool SelectPhysicalDevice() {
         uint32_t n = 0;
         vkEnumeratePhysicalDevices(m_Instance, &n, nullptr);
+        AILOGI("physical device count = %u", n);
         if (n == 0) return false;
         std::vector<VkPhysicalDevice> gpus(n);
         vkEnumeratePhysicalDevices(m_Instance, &n, gpus.data());
         for (auto g : gpus) {
             VkPhysicalDeviceProperties p;
             vkGetPhysicalDeviceProperties(g, &p);
+            AILOGI("  dev=%p  type=%d  name=%s",
+                   (void*)g, (int)p.deviceType, p.deviceName);
             if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
                 m_PhysicalDevice = g;
+                AILOGI("selected discrete GPU");
                 return true;
             }
         }
         m_PhysicalDevice = gpus[0];
+        AILOGI("selected first GPU");
         return true;
     }
 
@@ -155,6 +208,7 @@ private:
         for (uint32_t i = 0; i < n; ++i) {
             if (qs[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) { m_QueueFamily = i; break; }
         }
+        AILOGI("graphics queue family = %u", m_QueueFamily);
         if (m_QueueFamily == UINT32_MAX) return false;
 
         const char* dext[] = { "VK_KHR_swapchain" };
@@ -171,8 +225,11 @@ private:
         dci.pQueueCreateInfos = &qci;
         dci.enabledExtensionCount = 1;
         dci.ppEnabledExtensionNames = dext;
-        if (vkCreateDevice(m_PhysicalDevice, &dci, nullptr, &m_Device) != VK_SUCCESS) return false;
+        VkResult r = vkCreateDevice(m_PhysicalDevice, &dci, nullptr, &m_Device);
+        AILOGI("vkCreateDevice -> %d  device=%p", (int)r, (void*)m_Device);
+        if (r != VK_SUCCESS) return false;
         vkGetDeviceQueue(m_Device, m_QueueFamily, 0, &m_Queue);
+        AILOGI("vkGetDeviceQueue -> %p", (void*)m_Queue);
         return true;
     }
 
@@ -186,7 +243,9 @@ private:
         ci.maxSets = 64;
         ci.poolSizeCount = 1;
         ci.pPoolSizes = sizes;
-        return vkCreateDescriptorPool(m_Device, &ci, nullptr, &m_DescPool) == VK_SUCCESS;
+        VkResult r = vkCreateDescriptorPool(m_Device, &ci, nullptr, &m_DescPool);
+        AILOGI("vkCreateDescriptorPool -> %d  pool=%p", (int)r, (void*)m_DescPool);
+        return r == VK_SUCCESS;
     }
 
     bool CreateSurfaceAndSwapchain() {
@@ -196,11 +255,15 @@ private:
         sci.sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR;
         sci.window = m_Window;
         VkSurfaceKHR surface;
-        if (vkCreateAndroidSurfaceKHR(m_Instance, &sci, nullptr, &surface) != VK_SUCCESS) return false;
+        VkResult r = vkCreateAndroidSurfaceKHR(m_Instance, &sci, nullptr, &surface);
+        AILOGI("vkCreateAndroidSurfaceKHR -> %d  surface=%p", (int)r, (void*)surface);
+        if (r != VK_SUCCESS) return false;
         m_WD->Surface = surface;
 
         VkBool32 supported = VK_FALSE;
-        vkGetPhysicalDeviceSurfaceSupportKHR(m_PhysicalDevice, m_QueueFamily, surface, &supported);
+        vkGetPhysicalDeviceSurfaceSupportKHR(m_PhysicalDevice, m_QueueFamily,
+                                             surface, &supported);
+        AILOGI("surface supported = %d", (int)supported);
         if (!supported) return false;
 
         const VkFormat fmts[] = {
@@ -208,21 +271,22 @@ private:
             VK_FORMAT_B8G8R8_UNORM,   VK_FORMAT_R8G8B8_UNORM,
         };
         m_WD->SurfaceFormat = ImGui_ImplVulkanH_SelectSurfaceFormat(
-            m_PhysicalDevice, surface, fmts, IM_ARRAYSIZE(fmts), VK_COLORSPACE_SRGB_NONLINEAR_KHR);
+            m_PhysicalDevice, surface, fmts, IM_ARRAYSIZE(fmts),
+            VK_COLORSPACE_SRGB_NONLINEAR_KHR);
+        AILOGI("surface format = %d", (int)m_WD->SurfaceFormat.format);
 
-        // FIFO is hard vsync — the panel's vblank becomes our frame clock,
-        // giving a flat refresh-rate-bound FPS without any CPU spin (the
-        // wait happens inside vkAcquireNextImageKHR as the OS schedules us
-        // off the CPU between frames). For target rates below the panel
-        // refresh, main.cpp's drift-corrected sleep_until adds the gap.
         VkPresentModeKHR modes[] = { VK_PRESENT_MODE_FIFO_KHR };
         m_WD->PresentMode = ImGui_ImplVulkanH_SelectPresentMode(
             m_PhysicalDevice, surface, modes, IM_ARRAYSIZE(modes));
+        AILOGI("present mode = %d", (int)m_WD->PresentMode);
 
         ImGui_ImplVulkanH_CreateOrResizeWindow(
             m_Instance, m_PhysicalDevice, m_Device, m_WD,
             m_QueueFamily, nullptr, m_Width, m_Height, m_MinImageCount,
             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+        AILOGI("CreateOrResizeWindow -> size=%ux%u imageCount=%u renderPass=%p",
+               (unsigned)m_WD->Width, (unsigned)m_WD->Height,
+               (unsigned)m_WD->ImageCount, (void*)m_WD->RenderPass);
         return true;
     }
 
@@ -234,20 +298,23 @@ private:
         ii.QueueFamily = m_QueueFamily;
         ii.Queue = m_Queue;
         ii.DescriptorPool = m_DescPool;
-        // ImGui renders into the offscreen scene pass when bloom is wired up;
-        // otherwise it draws straight into the swapchain.
         ii.PipelineInfoMain.RenderPass = m_Bloom.Ready() ? m_Bloom.GetSceneRenderPass()
                                                         : m_WD->RenderPass;
         ii.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
         ii.MinImageCount = m_MinImageCount;
         ii.ImageCount = m_WD->ImageCount;
         ii.CheckVkResultFn = check_vk;
+        AILOGI("ImGui_ImplVulkan_Init renderPass=%p msaaSamples=%d imageCount=%u",
+               (void*)ii.PipelineInfoMain.RenderPass,
+               (int)ii.PipelineInfoMain.MSAASamples,
+               (unsigned)ii.ImageCount);
         ImGui_ImplVulkan_Init(&ii);
     }
 
     void RebuildSwapchain() {
         int w = ANativeWindow_getWidth(m_Window);
         int h = ANativeWindow_getHeight(m_Window);
+        AILOGI("RebuildSwapchain w=%d h=%d", w, h);
         if (w > 0 && h > 0) {
             usleep(200000);
             ImGui_ImplVulkan_SetMinImageCount(m_MinImageCount);
@@ -258,9 +325,6 @@ private:
             m_WD->FrameIndex = 0;
             m_Width = w; m_Height = h;
 
-            // Tear down and rebuild bloom against the new dimensions and
-            // swapchain render pass. If anything fails we fall back to the
-            // direct-to-swapchain path automatically.
             if (m_Bloom.Ready()) {
                 m_Bloom.Shutdown();
                 if (m_Bloom.Init(m_Device, m_PhysicalDevice, m_DescPool,
@@ -279,8 +343,13 @@ private:
         VkResult err;
         VkSemaphore acq = m_WD->FrameSemaphores[m_WD->SemaphoreIndex].ImageAcquiredSemaphore;
         VkSemaphore done = m_WD->FrameSemaphores[m_WD->SemaphoreIndex].RenderCompleteSemaphore;
-        err = vkAcquireNextImageKHR(m_Device, m_WD->Swapchain, UINT64_MAX, acq, VK_NULL_HANDLE, &m_WD->FrameIndex);
-        if (err == VK_ERROR_OUT_OF_DATE_KHR) { m_SwapChainRebuild = true; return; }
+        err = vkAcquireNextImageKHR(m_Device, m_WD->Swapchain, UINT64_MAX,
+                                    acq, VK_NULL_HANDLE, &m_WD->FrameIndex);
+        if (err == VK_ERROR_OUT_OF_DATE_KHR) {
+            AILOGW("vkAcquireNextImageKHR OUT_OF_DATE");
+            m_SwapChainRebuild = true;
+            return;
+        }
 
         ImGui_ImplVulkanH_Frame* fd = &m_WD->Frames[m_WD->FrameIndex];
         vkWaitForFences(m_Device, 1, &fd->Fence, VK_TRUE, UINT64_MAX);
@@ -293,9 +362,6 @@ private:
         vkBeginCommandBuffer(fd->CommandBuffer, &bi);
 
         if (m_Bloom.Ready()) {
-            // ImGui draws into the offscreen scene image, then threshold +
-            // separable Gaussian blur populate the bloom image, and the
-            // composite pass writes scene + bloom into the swapchain.
             m_Bloom.BeginScene(fd->CommandBuffer);
             ImGui_ImplVulkan_RenderDrawData(draw, fd->CommandBuffer);
             m_Bloom.EndSceneAndBlur(fd->CommandBuffer);
@@ -311,9 +377,6 @@ private:
             vkCmdBeginRenderPass(fd->CommandBuffer, &rpi, VK_SUBPASS_CONTENTS_INLINE);
             m_Bloom.RecordCompositeDraw(fd->CommandBuffer);
             vkCmdEndRenderPass(fd->CommandBuffer);
-
-            // Stash a copy of the just-rendered scene for next frame's
-            // shatter chips to sample.
             m_Bloom.RecordSnapshotCopy(fd->CommandBuffer);
         } else {
             VkRenderPassBeginInfo rpi{};
@@ -351,7 +414,11 @@ private:
         pi.pSwapchains = &m_WD->Swapchain;
         pi.pImageIndices = &m_WD->FrameIndex;
         err = vkQueuePresentKHR(m_Queue, &pi);
-        if (err == VK_ERROR_OUT_OF_DATE_KHR) { m_SwapChainRebuild = true; return; }
+        if (err == VK_ERROR_OUT_OF_DATE_KHR) {
+            AILOGW("vkQueuePresentKHR OUT_OF_DATE");
+            m_SwapChainRebuild = true;
+            return;
+        }
         m_WD->SemaphoreIndex = (m_WD->SemaphoreIndex + 1) % m_WD->SemaphoreCount;
     }
 
