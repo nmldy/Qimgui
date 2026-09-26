@@ -7,18 +7,6 @@
 #       -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24 \
 #       -DCMAKE_BUILD_TYPE=Release
 #   cmake --build build/arm64-v8a -j
-#
-# ── Configuration guide ─────────────────────────────────────────────────
-#   Release        (default) – size-optimised, stripped, no unwind tables.
-#                    Same profile as the legacy Application.mk build.
-#   RelWithDebInfo          – -O2 -g, keeps .symtab/.debug_*/unwind so a
-#                    tombstone can be decoded with
-#                      llvm-addr2line -e AImGui <pc>...
-#                      ndk-stack -sym build/arm64-v8a -dump tombstone_*.txt
-#                    Build with `-DCMAKE_BUILD_TYPE=RelWithDebInfo` when
-#                    you need to investigate a native crash.
-#   Debug                   – -O0 -g3, no size hacks at all.
-# ────────────────────────────────────────────────────────────────────────
 cmake_minimum_required(VERSION 3.18)
 project(AImGui LANGUAGES CXX)
 
@@ -27,66 +15,28 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# Default to Release when the caller didn't pick one, so a bare
-# `cmake -S . -B build` keeps the old behaviour.
-if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
-    set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
-endif()
-
-set(JNI ${CMAKE_SOURCE_DIR}/jni)
-
-# ── SURFACE_LOG_ENABLE ────────────────────────────────────────────────────
-# Previously hard-coded to 0 (fully silent). Keep that as the default so
-# shipped binaries match the old behaviour byte-for-byte in this respect,
-# but allow -DAIMGUI_SURFACE_LOG=ON to flip it back on for investigations
-# (init-order crashes, SurfaceComposerClient symbol resolution, ...).
-option(AIMGUI_SURFACE_LOG "Enable SURFACE_LOG_* macros in ANativeWindowCreator" OFF)
-if(AIMGUI_SURFACE_LOG)
-    add_compile_definitions(SURFACE_LOG_ENABLE=1)
-else()
-    add_compile_definitions(SURFACE_LOG_ENABLE=0)
-endif()
-
-# ── Common compile options (all configurations) ───────────────────────────
-# Section splitting helps --gc-sections; hidden visibility shrinks dynamic
-# symbol tables and lets the linker ICF aggressively.
-# Note: -flto is intentionally omitted. The old Application.mk listed it
-# under APP_LDFLAGS only, so no objects ever carried LTO IR and link-time
-# LTO was a no-op. Turning real LTO on broke
-# ANativeWindowCreator::ProcessMirrorDisplay() (the heavy-static-state
-# mirror path crashed when a screen-recording virtual display appeared).
+# Size-optimised flags shared by every target — mirror what the old
+# jni/Application.mk used so the resulting ELF stays small.
+# Note: -flto is intentionally omitted from both compile and link. The
+# old Application.mk listed it under APP_LDFLAGS only, so no objects ever
+# carried LTO IR and link-time LTO was a no-op. Turning real LTO on broke
+# ANativeWindowCreator::ProcessMirrorDisplay() (the hidden-visibility,
+# heavy-static-state mirror path crashed when a screen-recording virtual
+# display appeared). Keep the no-op for byte-for-byte parity with what
+# shipped before.
 add_compile_options(
+    -Os
     -ffunction-sections
     -fdata-sections
     -fvisibility=hidden
     -fvisibility-inlines-hidden
+    -fno-unwind-tables
+    -fno-asynchronous-unwind-tables
     -fno-rtti)
+add_compile_definitions(SURFACE_LOG_ENABLE=0)
+add_link_options(-Wl,--gc-sections -Wl,--icf=all -Wl,-s)
 
-# ── Per-configuration compile options ─────────────────────────────────────
-# The old CMakeLists applied -Os, -fno-unwind-tables and -Wl,-s
-# unconditionally. That produced the smallest possible ELF (matching the
-# legacy Application.mk build) — but it also stripped .symtab/.debug_* and
-# dropped DWARF unwind info, which is why a recent tombstone only had raw
-# PCs for the AImGui frames instead of function names / source lines.
-#
-#   Release        : same size profile as before (stripped, no unwind).
-#   RelWithDebInfo : -O2 -g, keep symbols + unwind for crash analysis.
-#   Debug          : -O0 -g3.
-add_compile_options(
-    $<$<CONFIG:Release>:-Os>
-    $<$<CONFIG:Release>:-fno-unwind-tables>
-    $<$<CONFIG:Release>:-fno-asynchronous-unwind-tables>
-    $<$<CONFIG:RelWithDebInfo>:-O2>
-    $<$<CONFIG:RelWithDebInfo>:-g>
-    $<$<CONFIG:Debug>:-O0>
-    $<$<CONFIG:Debug>:-g3>)
-
-# --gc-sections and --icf=all are size wins in every configuration.
-# -s (--strip-all) is only applied to the shipped Release binary; the
-# RelWithDebInfo / Debug builds must keep .symtab so a later tombstone
-# can be resolved with llvm-addr2line.
-add_link_options(-Wl,--gc-sections -Wl,--icf=all)
-add_link_options($<$<CONFIG:Release>:-Wl,-s>)
+set(JNI ${CMAKE_SOURCE_DIR}/jni)
 
 # ── Prebuilt Dear ImGui ──────────────────────────────────────────────────
 # Shipped under prebuilt/$ABI/libimgui.a; only public headers live in-tree.
