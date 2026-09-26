@@ -13,16 +13,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Clean working tree
-        run: |
-          find . -mindepth 1 -maxdepth 1 ! -name '.git' ! -name 'Qimgui-1.0.0.zip' ! -path './.github' -exec rm -rf {} +
-
+      # 先解压到临时目录（此时 zip 还在）
       - name: Unzip to temp
         run: unzip -o Qimgui-1.0.0.zip -d /tmp/extract
 
+      # 丢弃 zip 自带的 .github，避免 workflow 权限 403
       - name: Drop zip's own workflows
         run: rm -rf /tmp/extract/Qimgui-1.0.0/.github
 
+      # 清空一切，只保留 .git、.github/workflows 和 zip 本身
+      - name: Clean everything except .github/workflows and the zip
+        run: |
+          find . -mindepth 1 -maxdepth 1 ! -name '.git' ! -name 'Qimgui-1.0.0.zip' ! -path './.github' -exec rm -rf {} +
+          find .github -mindepth 1 -maxdepth 1 ! -name 'workflows' -exec rm -rf {} +
+
+      # 把解压内容摊平到根目录
       - name: Move contents to repo root
         run: |
           rsync -a /tmp/extract/Qimgui-1.0.0/ ./
