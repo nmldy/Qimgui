@@ -1,32 +1,39 @@
 #include "renderer.h"
 
-#include <android/log.h>
-
-#define LOG_TAG "AImGui"
-#define LOGI(fmt, ...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, fmt, ##__VA_ARGS__)
-#define LOGW(fmt, ...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, fmt, ##__VA_ARGS__)
+#include "aimgui_log.h"
 
 namespace aimgui {
 
 std::unique_ptr<IRenderer> MakeRenderer(ANativeWindow* window,
                                         int width, int height,
                                         Backend preferred) {
-    auto tryInit = [&](std::unique_ptr<IRenderer> r) -> std::unique_ptr<IRenderer> {
-        if (!r) return nullptr;
+    AILOGI("enter window=%p %dx%d preferred=%d",
+           window, width, height, (int)preferred);
+
+    auto tryInit = [&](std::unique_ptr<IRenderer> r,
+                       const char* name) -> std::unique_ptr<IRenderer> {
+        if (!r) {
+            AILOGE("factory returned null for %s", name);
+            return nullptr;
+        }
+        AILOGI("calling %s->Init ...", name);
         if (r->Init(window, width, height)) {
-            LOGI("renderer: %s", r->Name());
+            AILOGI("%s Init OK (Name=%s)", name, r->Name());
             return r;
         }
+        AILOGE("%s Init FAILED; tearing down", name);
         r->Shutdown();
         return nullptr;
     };
 
-    if (preferred == Backend::OpenGL) return tryInit(MakeGLRenderer());
-    if (preferred == Backend::Vulkan) return tryInit(MakeVKRenderer());
+    if (preferred == Backend::OpenGL)
+        return tryInit(MakeGLRenderer(), "OpenGL");
+    if (preferred == Backend::Vulkan)
+        return tryInit(MakeVKRenderer(), "Vulkan");
 
-    if (auto vk = tryInit(MakeVKRenderer())) return vk;
-    LOGW("Vulkan init failed, falling back to OpenGL ES 3");
-    return tryInit(MakeGLRenderer());
+    if (auto vk = tryInit(MakeVKRenderer(), "Vulkan")) return vk;
+    AILOGW("Vulkan init failed, falling back to OpenGL ES 3");
+    return tryInit(MakeGLRenderer(), "OpenGL");
 }
 
 } // namespace aimgui
